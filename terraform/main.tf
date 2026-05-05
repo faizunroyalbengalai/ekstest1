@@ -72,6 +72,11 @@ data "aws_subnets" "default" {
   }
 }
 
+data "aws_subnet" "default" {
+  for_each = toset(data.aws_subnets.default.ids)
+  id       = each.value
+}
+
 data "aws_caller_identity" "current" {}
 
 data "aws_eks_cluster_auth" "cluster" {
@@ -216,16 +221,23 @@ resource "aws_security_group" "eks_node_sg" {
   }
 }
 
-# EKS Cluster
+locals {
+  eks_supported_subnets = [
+    for id, subnet in data.aws_subnet.default :
+    id
+    if !contains(["use1-az3"], subnet.availability_zone_id)
+  ]
+}
+
 resource "aws_eks_cluster" "main" {
   name     = "${var.project_name}-cluster"
   role_arn = aws_iam_role.eks_cluster_role.arn
 
   vpc_config {
-    subnet_ids              = data.aws_subnets.default.ids
+    subnet_ids              = local.eks_supported_subnets
     security_group_ids      = [aws_security_group.eks_cluster_sg.id]
+    endpoint_private_access = true
     endpoint_public_access  = true
-    endpoint_private_access = false
   }
 
   depends_on = [
@@ -239,22 +251,18 @@ resource "aws_eks_cluster" "main" {
   }
 }
 
-# EKS Node Group
 resource "aws_eks_node_group" "main" {
   cluster_name    = aws_eks_cluster.main.name
   node_group_name = "${var.project_name}-node-group"
   node_role_arn   = aws_iam_role.eks_node_role.arn
-  subnet_ids      = data.aws_subnets.default.ids
-  instance_types  = [var.node_instance_type]
+  subnet_ids      = local.eks_supported_subnets
+
+  instance_types = [var.node_instance_type]
 
   scaling_config {
     desired_size = var.desired_capacity
     min_size     = var.min_size
     max_size     = var.max_size
-  }
-
-  update_config {
-    max_unavailable = 1
   }
 
   depends_on = [
@@ -267,180 +275,16 @@ resource "aws_eks_node_group" "main" {
     Project   = var.project_name
     ManagedBy = "devops-agent"
   }
-
-  lifecycle {
-    ignore_changes = [scaling_config[0].desired_size]
-  }
 }
 
-# ECR Repository
-resource "aws_ecr_repository" "app" {
-  name                 = "${var.project_name}-python"
-  image_tag_mutability = "MUTABLE"
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-
-  tags = {
-    Project   = var.project_name
-    ManagedBy = "devops-agent"
-  }
+output "cluster_name" {
+  value = aws_eks_cluster.main.name
 }
 
-resource "aws_ecr_lifecycle_policy" "app" {
-  repository = aws_ecr_repository.app.name
-
-  policy = jsonencode({
-    rules = [
-      {
-        rulePriority = 1
-        description  = "Keep last 10 images"
-        selection = {
-          tagStatus   = "any"
-          countType   = "imageCountMoreThan"
-          countNumber = 10
-        }
-        action = {
-          type = "expire"
-        }
-      }
-    ]
-  })
+output "cluster_endpoint" {
+  value = aws_eks_cluster.main.endpoint
 }
 
-# Kubernetes provider
-provider "kubernetes" {
-  host                   = aws_eks_cluster.main.endpoint
-  cluster_ca_certificate = base64decode(aws_eks_cluster.main.certificate_authority[0].data)
-  token                  = data.aws_eks_cluster_auth.cluster.token
-}
-
-# Kubernetes Namespace
-resource "kubernetes_namespace" "app" {
-  metadata {
-    name = var.project_name
-    labels = {
-      project   = var.project_name
-      managedBy = "devops-agent"
-    }
-  }
-
-  depends_on = [aws_eks_node_group.main]
-}
-
-# Kubernetes Deployment
-resource "kubernetes_deployment" "app" {
-  metadata {
-    name      = "python"
-    namespace = kubernetes_namespace.app.metadata[0].name
-    labels = {
-      app       = "python"
-      project   = var.project_name
-      managedBy = "devops-agent"
-    }
-  }
-
-  spec {
-    replicas = var.app_replicas
-
-    selector {
-      match_labels = {
-        app = "python"
-      }
-    }
-
-    template {
-      metadata {
-        labels = {
-          app     = "python"
-          project = var.project_name
-        }
-      }
-
-      spec {
-        container {
-          name  = "python"
-          image = var.app_image != "" ? var.app_image : "${aws_ecr_repository.app.repository_url}:latest"
-
-          port {
-            container_port = 8000
-          }
-
-          env {
-            name  = "PORT"
-            value = "8000"
-          }
-
-          resources {
-            requests = {
-              cpu    = "250m"
-              memory = "256Mi"
-            }
-            limits = {
-              cpu    = "500m"
-              memory = "512Mi"
-            }
-          }
-
-          liveness_probe {
-            http_get {
-              path = "/health"
-              port = 8000
-            }
-            initial_delay_seconds = 30
-            period_seconds        = 15
-            timeout_seconds       = 5
-            failure_threshold     = 3
-          }
-
-          readiness_probe {
-            http_get {
-              path = "/health"
-              port = 8000
-            }
-            initial_delay_seconds = 15
-            period_seconds        = 10
-            timeout_seconds       = 5
-            failure_threshold     = 3
-          }
-        }
-      }
-    }
-  }
-
-  depends_on = [aws_eks_node_group.main]
-}
-
-# Kubernetes Service (LoadBalancer)
-resource "kubernetes_service" "app" {
-  metadata {
-    name      = "python"
-    namespace = kubernetes_namespace.app.metadata[0].name
-    labels = {
-      app       = "python"
-      project   = var.project_name
-      managedBy = "devops-agent"
-    }
-    annotations = {
-      "service.beta.kubernetes.io/aws-load-balancer-type" = "external"
-    }
-  }
-
-  spec {
-    selector = {
-      app = "python"
-    }
-
-    port {
-      name        = "http"
-      port        = 80
-      target_port = 8000
-      protocol    = "TCP"
-    }
-
-    type = "LoadBalancer"
-  }
-
-  depends_on = [aws_eks_node_group.main]
+output "cluster_ca_certificate" {
+  value = aws_eks_cluster.main.certificate_authority[0].data
 }
